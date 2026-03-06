@@ -1,0 +1,18 @@
+# Xcode user data
+*.xcuserstate
+xcuserdata/
+
+# Claude settings
+.claude/
+
+# Build
+DerivedData/
+build/
+
+# CoreML models (large binary files)
+*.mlpackage
+*.mlmodelc
+*.mlmodel
+
+# OS
+.DS_Store
