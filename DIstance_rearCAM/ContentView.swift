@@ -37,21 +37,21 @@ struct ContentView: View {
                 }
                 .buttonStyle(.borderedProminent)
                 .controlSize(.large)
-                .disabled(!ARSessionManager.isLiDARAvailable)
+                .disabled(!ARSessionManager.isLiDARAvailable && !ARSessionManager.isFaceTrackingAvailable)
                 .padding(.horizontal, 40)
 
                 Spacer()
                     .frame(height: 60)
             }
             .onAppear {
-                if !ARSessionManager.isLiDARAvailable {
+                if !ARSessionManager.isLiDARAvailable && !ARSessionManager.isFaceTrackingAvailable {
                     showLiDARAlert = true
                 }
             }
-            .alert("LiDAR非対応", isPresented: $showLiDARAlert) {
+            .alert("カメラ非対応", isPresented: $showLiDARAlert) {
                 Button("OK") {}
             } message: {
-                Text("このデバイスはLiDARセンサーに対応していません。LiDAR搭載のiPad ProまたはiPhone Proが必要です。")
+                Text("このデバイスはLiDARセンサーおよびTrueDepthカメラに対応していません。")
             }
         }
     }

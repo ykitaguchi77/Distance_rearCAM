@@ -8,22 +8,28 @@
 import ARKit
 import SwiftUI
 
-// MARK: - ARSCNView Wrapper
+// MARK: - ARSCNView Wrapper（ラッパーUIViewで囲み、フロントカメラ時はラッパーを反転）
 
 struct ARViewContainer: UIViewRepresentable {
     let sessionManager: ARSessionManager
 
-    func makeUIView(context: Context) -> ARSCNView {
+    func makeUIView(context: Context) -> UIView {
+        let wrapper = UIView()
+        wrapper.clipsToBounds = true
+
         let scnView = ARSCNView()
         scnView.automaticallyUpdatesLighting = true
+        scnView.autoresizingMask = [.flexibleWidth, .flexibleHeight]
+        wrapper.addSubview(scnView)
+
         sessionManager.startSession(for: scnView)
-        return scnView
+        return wrapper
     }
 
-    func updateUIView(_ uiView: ARSCNView, context: Context) {}
+    func updateUIView(_ uiView: UIView, context: Context) {}
 
-    static func dismantleUIView(_ uiView: ARSCNView, coordinator: ()) {
-        uiView.session.pause()
+    static func dismantleUIView(_ uiView: UIView, coordinator: ()) {
+        (uiView.subviews.first as? ARSCNView)?.session.pause()
     }
 }
 
@@ -38,11 +44,12 @@ struct CameraView: View {
 
     var body: some View {
         ZStack {
-            // AR camera feed + face overlay（デジタルズームで一緒にスケール）
+            // AR camera feed（ラッパーUIViewがフロントカメラ時に自動反転）
             ARViewContainer(sessionManager: sessionManager)
                 .scaleEffect(sessionManager.currentZoomFactor)
                 .ignoresSafeArea()
 
+            // Face overlay（bbox座標はARSessionManager内でミラー済み）
             FaceOverlayView(faces: sessionManager.faces)
                 .scaleEffect(sessionManager.currentZoomFactor)
                 .ignoresSafeArea()
@@ -76,12 +83,28 @@ struct CameraView: View {
                 Spacer()
             }
 
-            // Left side: flash button (center) + zoom buttons (bottom)
+            // Left side: camera switch + flash (center) + zoom buttons (bottom)
             HStack {
                 VStack {
                     Spacer()
 
-                    // Flash toggle
+                    // Camera switch (front/rear)
+                    Button {
+                        sessionManager.toggleCamera()
+                        selectedZoom = 1.0
+                    } label: {
+                        Image(systemName: "camera.rotate.fill")
+                            .font(.system(size: 22))
+                            .foregroundColor(.white)
+                            .frame(width: 44, height: 44)
+                            .background(.ultraThinMaterial)
+                            .clipShape(Circle())
+                    }
+
+                    Spacer()
+                        .frame(height: 16)
+
+                    // Flash toggle（リア: トーチ / フロント: スクリーンフラッシュ）
                     Button {
                         sessionManager.flashEnabled.toggle()
                     } label: {
@@ -139,6 +162,13 @@ struct CameraView: View {
                     .padding(.trailing, 24)
                     .padding(.bottom, 40)
                 }
+            }
+
+            // スクリーンフラッシュ（フロントカメラ撮影時に画面全体を白く発光）
+            if sessionManager.screenFlashActive {
+                Color.white
+                    .ignoresSafeArea()
+                    .allowsHitTesting(false)
             }
         }
         .onDisappear {

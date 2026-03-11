@@ -61,11 +61,15 @@ class ARSessionManager: NSObject, ARSessionDelegate {
     var flashEnabled = false
     var currentZoomFactor: CGFloat = 1.0
     var captureCount = 0
+    var usingFrontCamera = false
+    var screenFlashActive = false
     weak var sceneView: ARSCNView?
 
     private let arSession = ARSession()
     private let processingQueue = DispatchQueue(label: "com.app.faceDetection", qos: .userInitiated)
     private var isProcessing = false
+    private var faceAnchorDistance: Float?
+    private var previousBrightness: CGFloat = 0.5
 
     // YOLO CoreML model
     private var visionModel: VNCoreMLModel?
@@ -82,6 +86,10 @@ class ARSessionManager: NSObject, ARSessionDelegate {
 
     static var isLiDARAvailable: Bool {
         ARWorldTrackingConfiguration.supportsFrameSemantics(.sceneDepth)
+    }
+
+    static var isFaceTrackingAvailable: Bool {
+        ARFaceTrackingConfiguration.isSupported
     }
 
     override init() {
@@ -110,11 +118,9 @@ class ARSessionManager: NSObject, ARSessionDelegate {
 
     func startSession(for view: ARSCNView) {
         sceneView = view
-        let config = ARWorldTrackingConfiguration()
-        config.frameSemantics.insert(.sceneDepth)
         arSession.delegate = self
         view.session = arSession
-        arSession.run(config)
+        runCurrentConfig()
     }
 
     func pauseSession() {
@@ -122,19 +128,64 @@ class ARSessionManager: NSObject, ARSessionDelegate {
     }
 
     func resumeSession() {
-        let config = ARWorldTrackingConfiguration()
-        config.frameSemantics.insert(.sceneDepth)
-        arSession.run(config)
+        runCurrentConfig()
+    }
+
+    func toggleCamera() {
+        arSession.pause()
+        usingFrontCamera.toggle()
+        faceAnchorDistance = nil
+        trackedFaces = []
+        faces = []
+        primaryDistance = nil
+        // フラッシュはリア(トーチ)/フロント(スクリーンフラッシュ)両対応のため維持
+        runCurrentConfig()
+    }
+
+    private func runCurrentConfig() {
+        isProcessing = false
+        if usingFrontCamera && ARFaceTrackingConfiguration.isSupported {
+            let config = ARFaceTrackingConfiguration()
+            arSession.run(config, options: [.resetTracking, .removeExistingAnchors])
+        } else {
+            if usingFrontCamera { usingFrontCamera = false }
+            let config = ARWorldTrackingConfiguration()
+            config.frameSemantics.insert(.sceneDepth)
+            arSession.run(config, options: [.resetTracking, .removeExistingAnchors])
+        }
     }
 
     // MARK: - ARSessionDelegate
+
+    func session(_ session: ARSession, didFailWithError error: Error) {
+        print("[ARSession] Failed: \(error.localizedDescription)")
+        isProcessing = false
+    }
+
+    func sessionWasInterrupted(_ session: ARSession) {
+        print("[ARSession] Interrupted")
+        isProcessing = false
+    }
+
+    func sessionInterruptionEnded(_ session: ARSession) {
+        print("[ARSession] Interruption ended, resuming")
+        runCurrentConfig()
+    }
 
     func session(_ session: ARSession, didUpdate frame: ARFrame) {
         guard !isProcessing, visionModel != nil else { return }
         isProcessing = true
 
+        // フロントカメラ時: ARFaceAnchorから距離取得
+        if usingFrontCamera {
+            if let faceAnchor = frame.anchors.compactMap({ $0 as? ARFaceAnchor }).first {
+                let t = faceAnchor.transform.columns.3
+                faceAnchorDistance = sqrt(t.x * t.x + t.y * t.y + t.z * t.z)
+            }
+        }
+
         let pixelBuffer = frame.capturedImage
-        let depthMap = frame.sceneDepth?.depthMap
+        let depthMap = usingFrontCamera ? nil : frame.sceneDepth?.depthMap
         let interfaceOrientation = Self.currentInterfaceOrientation()
         let visionOri = Self.visionOrientation(for: interfaceOrientation)
         let viewSize = sceneView?.bounds.size ?? CGSize(width: 1, height: 1)
@@ -165,7 +216,7 @@ class ARSessionManager: NSObject, ARSessionDelegate {
             let displayImageH: CGFloat
             switch interfaceOrientation {
             case .portrait, .portraitUpsideDown:
-                displayImageW = rawH  // 回転後
+                displayImageW = rawH
                 displayImageH = rawW
             default:
                 displayImageW = rawW
@@ -181,7 +232,7 @@ class ARSessionManager: NSObject, ARSessionDelegate {
             var detections: [(displayRect: CGRect, distance: Float?, label: String?, confidence: Float?)] = []
             for det in currentDetections {
                 let bbox = det.boundingBox
-                let displayRect: CGRect
+                var displayRect: CGRect
                 switch interfaceOrientation {
                 case .portrait:
                     displayRect = CGRect(
@@ -199,8 +250,11 @@ class ARSessionManager: NSObject, ARSessionDelegate {
                     )
                 }
 
-                let distance = depthMap.flatMap {
-                    Self.readDepth(from: $0, visionBBox: bbox, orientation: visionOri)
+                let distance: Float?
+                if let depthMap {
+                    distance = Self.readDepth(from: depthMap, visionBBox: bbox, orientation: visionOri)
+                } else {
+                    distance = self.faceAnchorDistance
                 }
                 detections.append((displayRect: displayRect, distance: distance,
                                    label: det.label, confidence: det.confidence))
@@ -277,7 +331,6 @@ class ARSessionManager: NSObject, ARSessionDelegate {
             if let match = bestMatch,
                 Self.centerDistance(match.smoothedRect, detection.displayRect) < matchThreshold
             {
-                // Reuse existing ID, smooth bbox position, raw distance
                 let face = TrackedFace(
                     id: match.id,
                     smoothedRect: Self.smoothRect(
@@ -486,13 +539,11 @@ class ARSessionManager: NSObject, ARSessionDelegate {
     }
 
     // MARK: - Zoom Control (デジタルズーム)
-    // ズーム表示はSwiftUIの.scaleEffect()で行う。ここではfactorの管理のみ。
 
     func setZoom(factor: CGFloat) {
         currentZoomFactor = min(max(factor, 1.0), 3.0)
     }
 
-    /// デジタルズーム分を中央クロップする
     private func applyZoomCrop(to image: UIImage) -> UIImage {
         guard currentZoomFactor > 1.01, let cgImage = image.cgImage else { return image }
         let w = CGFloat(cgImage.width)
@@ -514,15 +565,29 @@ class ARSessionManager: NSObject, ARSessionDelegate {
     func captureFrameForAnalysis() {
         guard let sceneView else { return }
 
-        if flashEnabled { setTorch(on: true) }
+        if flashEnabled {
+            if usingFrontCamera {
+                // スクリーンフラッシュ: 画面を白く発光 + 輝度最大
+                screenFlashActive = true
+                previousBrightness = UIScreen.main.brightness
+                UIScreen.main.brightness = 1.0
+            } else {
+                setTorch(on: true)
+            }
+        }
 
-        // LED安定待ち後にスナップショット
-        DispatchQueue.main.asyncAfter(deadline: .now() + (flashEnabled ? 0.2 : 0)) { [weak self] in
+        DispatchQueue.main.asyncAfter(deadline: .now() + (flashEnabled ? 0.3 : 0)) { [weak self] in
             guard let self else { return }
             let snapshot = sceneView.snapshot()
-            if self.flashEnabled { self.setTorch(on: false) }
+            if self.flashEnabled {
+                if self.usingFrontCamera {
+                    self.screenFlashActive = false
+                    UIScreen.main.brightness = self.previousBrightness
+                } else {
+                    self.setTorch(on: false)
+                }
+            }
 
-            // ROI切り出しはフルフレームから行う（座標がフルフレーム基準のため）
             guard let fullCGImage = snapshot.cgImage else { return }
 
             let fullW = CGFloat(fullCGImage.width)
@@ -571,7 +636,6 @@ class ARSessionManager: NSObject, ARSessionDelegate {
                 ))
             }
 
-            // 表示用のfullImageのみズームクロップ適用
             let displayImage = self.applyZoomCrop(to: snapshot)
 
             self.capturedFrame = CapturedFrame(
